@@ -136,15 +136,16 @@ bool CHttpServer::StartServer(const SERVER_OPTIONS& op, const std::function<void
 		options[opCount++] = globalAuthPath.c_str();
 	}
 
+#ifdef LUA_BUILD_AS_DLL
 	//LuaのDLLが無いとき分かりにくいタイミングでエラーになるので事前に読んでおく(必須ではない)
 	this->hLuaDll = LoadLibrary(LUA_DLL_NAME);
 	if( this->hLuaDll == NULL ){
 		OutputDebugString(L"CHttpServer::StartServer(): " LUA_DLL_NAME L" not found.\r\n");
 		return false;
 	}
+#endif
 
-	//"serve files" + "support Lua" + "support caching" + (セキュアポートを含むとき)"support HTTPS"
-	unsigned int feat = 1 + 32 + 128 + (ports.find('s') != string::npos ? 2 : 0);
+	unsigned int feat = MG_FEATURES_FILES + MG_FEATURES_LUA + MG_FEATURES_CACHE + (ports.find('s') != string::npos ? MG_FEATURES_TLS : 0);
 	this->initedLibrary = true;
 	if( mg_init_library(feat) != feat ){
 		OutputDebugString(L"CHttpServer::StartServer(): Library initialization failed.\r\n");

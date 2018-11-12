@@ -9,11 +9,8 @@
 #include "resource.h"
 #include <shellapi.h>
 #include <tlhelp32.h>
-#include <LM.h>
+#include <lm.h>
 #pragma comment (lib, "netapi32.lib")
-
-//互換動作のためのグローバルなフラグ(この手法は綺麗ではないが最もシンプルなので)
-DWORD g_compatFlags;
 
 namespace
 {
@@ -66,8 +63,10 @@ struct MAIN_WINDOW_CONTEXT {
 	bool autoAddCheckAddCountUpdated;
 	bool taskFlag;
 	bool showBalloonTip;
+	//0,1,2:NOTIFY_UPDATE_SRV_STATUSの値, 3:無効, 3<:点滅
 	DWORD notifySrvStatus;
-	__int64 notifyActiveTime;
+	__int64 notifyTipActiveTime;
+	RESERVE_DATA notifyTipReserve;
 	MAIN_WINDOW_CONTEXT(CEpgTimerSrvMain* sys_)
 		: sys(sys_)
 		, msgTaskbarCreated(RegisterWindowMessage(L"TaskbarCreated"))
@@ -78,7 +77,7 @@ struct MAIN_WINDOW_CONTEXT {
 		, taskFlag(false)
 		, showBalloonTip(false)
 		, notifySrvStatus(0)
-		, notifyActiveTime(LLONG_MAX) {}
+		, notifyTipActiveTime(LLONG_MAX) {}
 };
 
 //必要なバッファを確保してGetPrivateProfileSection()を呼ぶ
@@ -143,7 +142,7 @@ bool CEpgTimerSrvMain::Main(bool serviceFlag_)
 	this->notifyManager.SetGUI(!serviceFlag_);
 	this->residentFlag = serviceFlag_;
 
-	g_compatFlags = GetPrivateProfileInt(L"SET", L"CompatFlags", 0, GetModuleIniPath().c_str());
+	this->compatFlags = 4095;
 
 	fs_path settingPath = GetSettingPath();
 	this->epgAutoAdd.ParseText(fs_path(settingPath).append(EPG_AUTO_ADD_TEXT_NAME).c_str());
@@ -458,6 +457,10 @@ LRESULT CALLBACK CEpgTimerSrvMain::MainWndProc(HWND hwnd, UINT uMsg, WPARAM wPar
 		SetWindowLongPtr(hwnd, GWLP_USERDATA, (LONG_PTR)ctx);
 		ctx->sys->hwndMain = hwnd;
 		ctx->sys->ReloadSetting(true);
+		if( ctx->sys->reserveManager.GetTunerReserveAll().size() <= 1 ){
+			//チューナなし
+			ctx->notifySrvStatus = 3;
+		}
 		ctx->sys->ReloadNetworkSetting();
 		//サービスモードでは任意アクセス可能なパイプを生成する。状況によってはセキュリティリスクなので注意
 		ctx->pipeServer.StartServer(CMD2_EPG_SRV_EVENT_WAIT_CONNECT, CMD2_EPG_SRV_PIPE,
@@ -577,24 +580,37 @@ LRESULT CALLBACK CEpgTimerSrvMain::MainWndProc(HWND hwnd, UINT uMsg, WPARAM wPar
 	case WM_APP_RECEIVE_NOTIFY:
 		//通知を受け取る
 		{
-			vector<NOTIFY_SRV_INFO> list(1);
+			vector<NOTIFY_SRV_INFO> list;
 			if( wParam ){
 				//更新だけ
-				list.back().notifyID = NOTIFY_UPDATE_SRV_STATUS;
-				list.back().param1 = ctx->notifySrvStatus;
+				NOTIFY_SRV_INFO status = {};
+				status.notifyID = NOTIFY_UPDATE_SRV_STATUS;
+				status.param1 = ctx->notifySrvStatus;
+				list.push_back(status);
 			}else{
 				list = ctx->sys->notifyManager.RemoveSentList();
 				ctx->tcpServer.NotifyUpdate();
 			}
 			for( vector<NOTIFY_SRV_INFO>::const_iterator itr = list.begin(); itr != list.end(); itr++ ){
+				int notifyTipStyle;
+				bool blinkPreRec;
+				bool saveNotifyLog;
+				{
+					CBlockLock lock(&ctx->sys->settingLock);
+					notifyTipStyle = ctx->sys->setting.notifyTipStyle;
+					blinkPreRec = ctx->sys->setting.blinkPreRec;
+					saveNotifyLog = ctx->sys->setting.saveNotifyLog;
+				}
 				if( itr->notifyID == NOTIFY_UPDATE_SRV_STATUS ||
 				    itr->notifyID == NOTIFY_UPDATE_PRE_REC_START && itr->param4.find(L'/') != wstring::npos &&
-				    (ctx->notifySrvStatus == 0 || ctx->notifySrvStatus > 2) && ctx->sys->setting.blinkPreRec ){
-					if( itr->notifyID == NOTIFY_UPDATE_SRV_STATUS ){
-						ctx->notifySrvStatus = itr->param1;
-					}else{
-						ctx->notifySrvStatus = SRV_STATUS_PRE_REC;
-						SetTimer(hwnd, TIMER_INC_SRV_STATUS, 1000, NULL);
+				    (ctx->notifySrvStatus == 0 || ctx->notifySrvStatus > 3) && blinkPreRec ){
+					if( ctx->notifySrvStatus != 3 ){
+						if( itr->notifyID == NOTIFY_UPDATE_SRV_STATUS ){
+							ctx->notifySrvStatus = itr->param1;
+						}else{
+							ctx->notifySrvStatus = SRV_STATUS_PRE_REC;
+							SetTimer(hwnd, TIMER_INC_SRV_STATUS, 1000, NULL);
+						}
 					}
 					if( ctx->taskFlag ){
 						NOTIFYICONDATA nid = {};
@@ -603,10 +619,28 @@ LRESULT CALLBACK CEpgTimerSrvMain::MainWndProc(HWND hwnd, UINT uMsg, WPARAM wPar
 						nid.uID = 1;
 						nid.hIcon = LoadSmallIcon(ctx->notifySrvStatus == 1 ? IDI_ICON_RED :
 						                          ctx->notifySrvStatus == 2 ? IDI_ICON_GREEN :
+						                          ctx->notifySrvStatus == 3 ? IDI_ICON_GRAY :
 						                          ctx->notifySrvStatus % 2 ? IDI_ICON_SEMI : IDI_ICON_BLUE);
-						if( ctx->notifyActiveTime != LLONG_MAX ){
+						if( ctx->notifySrvStatus == 3 ){
+							wcscpy_s(nid.szTip, L"チューナーがありません");
+						}else if( notifyTipStyle == 1 ){
+							wstring tip = L"次の予約なし";
+							if( ctx->notifyTipActiveTime != LLONG_MAX && ctx->notifyTipReserve.reserveID != 0 ){
+								SYSTEMTIME st = ctx->notifyTipReserve.startTime;
+								SYSTEMTIME stEnd;
+								ConvertSystemTime(ConvertI64Time(st) + ctx->notifyTipReserve.durationSecond * I64_1SEC, &stEnd);
+								Format(tip, L"次の予約：%s %d/%d(%s) %d:%02d-%d:%02d %s",
+								       ctx->notifyTipReserve.stationName.c_str(),
+								       st.wMonth, st.wDay, GetDayOfWeekName(st.wDayOfWeek), st.wHour, st.wMinute,
+								       stEnd.wHour, stEnd.wMinute, ctx->notifyTipReserve.title.c_str());
+								if( tip.size() > 95 ){
+									tip.replace(92, wstring::npos, L"...");
+								}
+							}
+							wcsncpy_s(nid.szTip, tip.c_str(), _TRUNCATE);
+						}else if( ctx->notifyTipActiveTime != LLONG_MAX ){
 							SYSTEMTIME st;
-							ConvertSystemTime(ctx->notifyActiveTime + 30 * I64_1SEC, &st);
+							ConvertSystemTime(ctx->notifyTipActiveTime + 30 * I64_1SEC, &st);
 							swprintf_s(nid.szTip, L"次の予約・取得：%d/%d(%s) %d:%02d",
 								st.wMonth, st.wDay, GetDayOfWeekName(st.wDayOfWeek), st.wHour, st.wMinute);
 						}
@@ -639,7 +673,7 @@ LRESULT CALLBACK CEpgTimerSrvMain::MainWndProc(HWND hwnd, UINT uMsg, WPARAM wPar
 					if( nid.szInfoTitle[0] ){
 						LPCWSTR info = itr->notifyID == NOTIFY_UPDATE_EPGCAP_START ? L"開始" :
 						               itr->notifyID == NOTIFY_UPDATE_EPGCAP_END ? L"終了" : itr->param4.c_str();
-						if( ctx->sys->setting.saveNotifyLog ){
+						if( saveNotifyLog ){
 							//通知情報ログ保存
 							fs_path logPath = GetModulePath().replace_filename(L"EpgTimerSrvNotify.log");
 							std::unique_ptr<FILE, decltype(&fclose)> fp(shared_wfopen(logPath.c_str(), L"abN"), fclose);
@@ -651,8 +685,8 @@ LRESULT CALLBACK CEpgTimerSrvMain::MainWndProc(HWND hwnd, UINT uMsg, WPARAM wPar
 								SYSTEMTIME st = itr->time;
 								wstring log = wstring(nid.szInfoTitle) + L"] " + info;
 								Replace(log, L"\r\n", L"  ");
-								fwprintf(fp.get(), L"%d/%02d/%02d %02d:%02d:%02d.%03d [%s\r\n",
-								         st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, log.c_str());
+								fwprintf_s(fp.get(), L"%d/%02d/%02d %02d:%02d:%02d.%03d [%s\r\n",
+								           st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, log.c_str());
 							}
 						}
 						if( ctx->showBalloonTip ){
@@ -675,8 +709,11 @@ LRESULT CALLBACK CEpgTimerSrvMain::MainWndProc(HWND hwnd, UINT uMsg, WPARAM wPar
 		//タスクトレイ関係
 		switch( LOWORD(lParam) ){
 		case WM_LBUTTONUP:
-			OpenGUI();
-			break;
+			if( ctx->notifySrvStatus != 3 ){
+				OpenGUI();
+				break;
+			}
+			//FALL THROUGH!
 		case WM_RBUTTONUP:
 			{
 				HMENU hMenu = LoadMenu(GetModuleHandle(NULL), MAKEINTRESOURCE(IDR_MENU_TRAY));
@@ -830,17 +867,24 @@ LRESULT CALLBACK CEpgTimerSrvMain::MainWndProc(HWND hwnd, UINT uMsg, WPARAM wPar
 					_OutputDebugString(L"SetThreadExecutionState(0x%08x)\r\n", (DWORD)esFlags);
 				}
 				//チップヘルプの更新が必要かチェック
-				__int64 activeTime = ctx->sys->reserveManager.GetSleepReturnTime(GetNowI64Time());
-				if( activeTime != ctx->notifyActiveTime ){
-					ctx->notifyActiveTime = activeTime;
+				RESERVE_DATA r;
+				__int64 activeTime = ctx->sys->reserveManager.GetSleepReturnTime(GetNowI64Time(), &r);
+				if( activeTime != ctx->notifyTipActiveTime || activeTime != LLONG_MAX &&
+				    (r.reserveID != ctx->notifyTipReserve.reserveID ||
+				     ConvertI64Time(r.startTime) != ConvertI64Time(ctx->notifyTipReserve.startTime) ||
+				     r.durationSecond != ctx->notifyTipReserve.durationSecond ||
+				     r.stationName != ctx->notifyTipReserve.stationName ||
+				     r.title != ctx->notifyTipReserve.title) ){
+					ctx->notifyTipActiveTime = activeTime;
+					ctx->notifyTipReserve = std::move(r);
 					SetTimer(hwnd, TIMER_RETRY_ADD_TRAY, 0, NULL);
 				}
 			}
 			break;
 		case TIMER_CHECK:
 			{
-				DWORD ret = ctx->sys->reserveManager.Check();
-				switch( HIWORD(ret) ){
+				pair<CReserveManager::CHECK_STATUS, int> ret = ctx->sys->reserveManager.Check();
+				switch( ret.first ){
 				case CReserveManager::CHECK_EPGCAP_END:
 					//EPGリロード完了後にデフォルトのシャットダウン動作を試みる
 					ctx->sys->epgDB.ReloadEpgData(true);
@@ -857,8 +901,8 @@ LRESULT CALLBACK CEpgTimerSrvMain::MainWndProc(HWND hwnd, UINT uMsg, WPARAM wPar
 					//チェックは必須
 					SendMessage(hwnd, WM_APP_RELOAD_EPG_CHK, 0, 0);
 					//要求されたシャットダウン動作を試みる
-					ctx->shutdownModePending = LOBYTE(ret);
-					ctx->rebootFlagPending = HIBYTE(ret) != 0;
+					ctx->shutdownModePending = LOBYTE(ret.second);
+					ctx->rebootFlagPending = HIBYTE(ret.second) != 0;
 					if( ctx->shutdownModePending == SD_MODE_INVALID ){
 						ctx->shutdownModePending = (ctx->sys->setting.recEndMode + 3) % 4 + 1;
 						ctx->rebootFlagPending = ctx->sys->setting.reboot;
@@ -1041,7 +1085,7 @@ void CEpgTimerSrvMain::InitReserveMenuPopup(HMENU hMenu, vector<RESERVE_DATA>& l
 		SYSTEMTIME endTime;
 		ConvertSystemTime(ConvertI64Time(list[i].startTime) + list[i].durationSecond * I64_1SEC, &endTime);
 		WCHAR text[128];
-		swprintf_s(text, L"%02d:%02d～%02d:%02d%s %.31s 【%.31s】",
+		swprintf_s(text, L"%02d:%02d-%02d:%02d%s %.31s 【%.31s】",
 		           list[i].startTime.wHour, list[i].startTime.wMinute, endTime.wHour, endTime.wMinute,
 		           list[i].recSetting.recMode == RECMODE_VIEW ? L"▲" : L"",
 		           list[i].title.c_str(), list[i].stationName.c_str());
@@ -1126,6 +1170,7 @@ void CEpgTimerSrvMain::ReloadSetting(bool initialize)
 		this->reserveManager.ReloadSetting(s);
 	}
 	this->epgDB.SetArchivePeriod(s.epgArchivePeriodHour * 3600);
+	SetSaveDebugLog(s.saveDebugLog);
 
 	CBlockLock lock(&this->settingLock);
 
@@ -1137,6 +1182,9 @@ void CEpgTimerSrvMain::ReloadSetting(bool initialize)
 			//タスクトレイに表示するかどうか
 			PostMessage(this->hwndMain, WM_APP_SHOW_TRAY, this->setting.residentMode >= 2, !this->setting.noBalloonTip);
 		}
+	}else if( this->setting.residentMode >= 2 ){
+		//チップヘルプを更新するため
+		PostMessage(this->hwndMain, WM_APP_RECEIVE_NOTIFY, TRUE, 0);
 	}
 	this->useSyoboi = GetPrivateProfileInt(L"SYOBOI", L"use", 0, iniPath.c_str()) != 0;
 }
@@ -1145,10 +1193,12 @@ RESERVE_DATA CEpgTimerSrvMain::GetDefaultReserveData(__int64 startTime) const
 {
 	CBlockLock lock(&this->settingLock);
 
-	RESERVE_DATA r;
+	RESERVE_DATA r = {};
 	r.reserveID = 0x7FFFFFFF;
 	ConvertSystemTime(startTime, &r.startTime);
 	r.startTimeEpg = r.startTime;
+	r.recSetting.recMode = RECMODE_SERVICE;
+	r.recSetting.priority = 1;
 	r.recSetting.suspendMode = (this->setting.recEndMode + 3) % 4 + 1;
 	r.recSetting.rebootFlag = this->setting.reboot;
 	r.recSetting.useMargineFlag = 1;
@@ -1156,6 +1206,8 @@ RESERVE_DATA CEpgTimerSrvMain::GetDefaultReserveData(__int64 startTime) const
 	r.recSetting.endMargine = this->setting.endMargin;
 	r.recSetting.serviceMode = (this->setting.enableCaption ? RECSERVICEMODE_CAP : 0) |
 	                           (this->setting.enableData ? RECSERVICEMODE_DATA : 0) | RECSERVICEMODE_SET;
+	//*以降をBatFileTagとして扱うことを示す
+	r.recSetting.batFilePath = L"*";
 	return r;
 }
 
@@ -1372,8 +1424,7 @@ void CEpgTimerSrvMain::AutoAddReserveEPG(const EPG_AUTO_ADD_DATA& data, vector<R
 	__int64 now = GetNowI64Time();
 
 	vector<CEpgDBManager::SEARCH_RESULT_EVENT_DATA> resultList;
-	vector<EPGDB_SEARCH_KEY_INFO> key(1, data.searchInfo);
-	this->epgDB.SearchEpg(&key, &resultList);
+	this->epgDB.SearchEpg(&data.searchInfo, 1, &resultList);
 	for( size_t i = 0; i < resultList.size(); i++ ){
 		const EPGDB_EVENT_INFO& info = resultList[i].info;
 		//時間未定でなく対象期間内かどうか
@@ -1382,11 +1433,11 @@ void CEpgTimerSrvMain::AutoAddReserveEPG(const EPG_AUTO_ADD_DATA& data, vector<R
 			addCount++;
 			if( this->reserveManager.IsFindReserve(info.original_network_id, info.transport_stream_id, info.service_id, info.event_id) == false ){
 				bool found = false;
-				if( info.eventGroupInfo != NULL && chkGroupEvent ){
+				if( info.eventGroupInfoGroupType && chkGroupEvent ){
 					//イベントグループのチェックをする
-					for( size_t j = 0; found == false && j < info.eventGroupInfo->eventDataList.size(); j++ ){
+					for( size_t j = 0; found == false && j < info.eventGroupInfo.eventDataList.size(); j++ ){
 						//group_typeは必ず1(イベント共有)
-						const EPGDB_EVENT_DATA& e = info.eventGroupInfo->eventDataList[j];
+						const EPGDB_EVENT_DATA& e = info.eventGroupInfo.eventDataList[j];
 						if( this->reserveManager.IsFindReserve(e.original_network_id, e.transport_stream_id, e.service_id, e.event_id) ){
 							found = true;
 							break;
@@ -1429,8 +1480,8 @@ void CEpgTimerSrvMain::AutoAddReserveEPG(const EPG_AUTO_ADD_DATA& data, vector<R
 					//まだ存在しないので追加対象
 					setList.resize(setList.size() + 1);
 					RESERVE_DATA& item = setList.back();
-					if( info.shortInfo != NULL ){
-						item.title = info.shortInfo->event_name;
+					if( info.hasShortInfo ){
+						item.title = info.shortInfo.event_name;
 					}
 					item.startTime = info.start_time;
 					item.startTimeEpg = item.startTime;
@@ -1709,7 +1760,7 @@ void CEpgTimerSrvMain::CtrlCmdCallback(CEpgTimerSrvMain* sys, CMD_STREAM* cmdPar
 		}else{
 			vector<EPGDB_SEARCH_KEY_INFO> key;
 			if( ReadVALUE(&key, cmdParam->data, cmdParam->dataSize, NULL) ){
-				sys->epgDB.SearchEpg(&key, [=](vector<CEpgDBManager::SEARCH_RESULT_EVENT>& val) {
+				sys->epgDB.SearchEpg(key.data(), key.size(), [=](vector<CEpgDBManager::SEARCH_RESULT_EVENT>& val) {
 					vector<const EPGDB_EVENT_INFO*> valp;
 					valp.reserve(val.size());
 					for( size_t i = 0; i < val.size(); valp.push_back(val[i++].info) );
@@ -2543,13 +2594,13 @@ void CEpgTimerSrvMain::CtrlCmdCallback(CEpgTimerSrvMain* sys, CMD_STREAM* cmdPar
 			}else{
 				EPG_AUTO_ADD_DATA item;
 				if( DeprecatedReadVALUE(&item, cmdParam->data, cmdParam->dataSize) ){
-					vector<EPGDB_SEARCH_KEY_INFO> key(1, item.searchInfo);
 					vector<CEpgDBManager::SEARCH_RESULT_EVENT_DATA> val;
-					if( sys->epgDB.SearchEpg(&key, &val) ){
+					sys->epgDB.SearchEpg(&item.searchInfo, 1, &val);
+					{
 						sys->oldSearchList[tcpFlag].clear();
 						sys->oldSearchList[tcpFlag].resize(val.size());
 						for( size_t i = 0; i < val.size(); i++ ){
-							sys->oldSearchList[tcpFlag][val.size() - i - 1].DeepCopy(val[i].info);
+							std::swap(sys->oldSearchList[tcpFlag][val.size() - i - 1], val[i].info);
 						}
 						if( sys->oldSearchList[tcpFlag].empty() == false ){
 							resParam->data = DeprecatedNewWriteVALUE(sys->oldSearchList[tcpFlag].back(), resParam->dataSize);
@@ -2586,7 +2637,7 @@ bool CEpgTimerSrvMain::CtrlCmdProcessCompatible(CMD_STREAM& cmdParam, CMD_STREAM
 
 	switch( cmdParam.param ){
 	case CMD2_EPG_SRV_ISREGIST_GUI_TCP:
-		if( g_compatFlags & 0x04 ){
+		if( this->compatFlags & 0x04 ){
 			//互換動作: TCP接続の登録状況確認コマンドを実装する
 			OutputDebugString(L"CMD2_EPG_SRV_ISREGIST_GUI_TCP\r\n");
 			REGIST_TCP_INFO val;
@@ -2602,7 +2653,7 @@ bool CEpgTimerSrvMain::CtrlCmdProcessCompatible(CMD_STREAM& cmdParam, CMD_STREAM
 		}
 		break;
 	case CMD2_EPG_SRV_PROFILE_UPDATE:
-		if( g_compatFlags & 0x08 ){
+		if( this->compatFlags & 0x08 ){
 			//互換動作: 設定更新通知コマンドを実装する
 			OutputDebugString(L"CMD2_EPG_SRV_PROFILE_UPDATE\r\n");
 			wstring val = L"";
@@ -2613,7 +2664,7 @@ bool CEpgTimerSrvMain::CtrlCmdProcessCompatible(CMD_STREAM& cmdParam, CMD_STREAM
 		}
 		break;
 	case CMD2_EPG_SRV_GET_NETWORK_PATH:
-		if( g_compatFlags & 0x10 ){
+		if( this->compatFlags & 0x10 ){
 			//互換動作: ネットワークパス取得コマンドを実装する
 			OutputDebugString(L"CMD2_EPG_SRV_GET_NETWORK_PATH\r\n");
 			wstring path;
@@ -2663,7 +2714,7 @@ bool CEpgTimerSrvMain::CtrlCmdProcessCompatible(CMD_STREAM& cmdParam, CMD_STREAM
 		}
 		break;
 	case CMD2_EPG_SRV_SEARCH_PG2:
-		if( g_compatFlags & 0x20 ){
+		if( this->compatFlags & 0x20 ){
 			//互換動作: 番組検索の追加コマンドを実装する
 			OutputDebugString(L"CMD2_EPG_SRV_SEARCH_PG2\r\n");
 			if( this->epgDB.IsInitialLoadingDataDone() == false ){
@@ -2674,7 +2725,7 @@ bool CEpgTimerSrvMain::CtrlCmdProcessCompatible(CMD_STREAM& cmdParam, CMD_STREAM
 				if( ReadVALUE(&ver, cmdParam.data, cmdParam.dataSize, &readSize) ){
 					vector<EPGDB_SEARCH_KEY_INFO> key;
 					if( ReadVALUE2(ver, &key, cmdParam.data.get() + readSize, cmdParam.dataSize - readSize, NULL) ){
-						this->epgDB.SearchEpg(&key, [=, &resParam](vector<CEpgDBManager::SEARCH_RESULT_EVENT>& val) {
+						this->epgDB.SearchEpg(key.data(), key.size(), [=, &resParam](vector<CEpgDBManager::SEARCH_RESULT_EVENT>& val) {
 							vector<const EPGDB_EVENT_INFO*> valp;
 							valp.reserve(val.size());
 							for( size_t i = 0; i < val.size(); valp.push_back(val[i++].info) );
@@ -2688,7 +2739,7 @@ bool CEpgTimerSrvMain::CtrlCmdProcessCompatible(CMD_STREAM& cmdParam, CMD_STREAM
 		}
 		break;
 	case CMD2_EPG_SRV_SEARCH_PG_BYKEY2:
-		if( g_compatFlags & 0x20 ){
+		if( this->compatFlags & 0x20 ){
 			//互換動作: 番組検索の追加コマンドを実装する
 			OutputDebugString(L"CMD2_EPG_SRV_SEARCH_PG_BYKEY2\r\n");
 			if( this->epgDB.IsInitialLoadingDataDone() == false ){
@@ -2708,10 +2759,8 @@ bool CEpgTimerSrvMain::CtrlCmdProcessCompatible(CMD_STREAM& cmdParam, CMD_STREAM
 						dummy.event_id = 0;
 						GetSystemTime(&dummy.start_time);
 						for( size_t i = 0; i < key.size(); i++ ){
-							vector<EPGDB_SEARCH_KEY_INFO> byKey(1, key[i]);
-							if( this->epgDB.SearchEpg(&byKey, &byResult[i]) ){
-								for( size_t j = 0; j < byResult[i].size(); valp.push_back(&byResult[i][j++].info) );
-							}
+							this->epgDB.SearchEpg(&key[i], 1, &byResult[i]);
+							for( size_t j = 0; j < byResult[i].size(); valp.push_back(&byResult[i][j++].info) );
 							valp.push_back(&dummy);
 						}
 						resParam.data = NewWriteVALUE2WithVersion(ver, valp, resParam.dataSize);
@@ -2723,7 +2772,7 @@ bool CEpgTimerSrvMain::CtrlCmdProcessCompatible(CMD_STREAM& cmdParam, CMD_STREAM
 		}
 		break;
 	case CMD2_EPG_SRV_GET_RECINFO_LIST2:
-		if( g_compatFlags & 0x40 ){
+		if( this->compatFlags & 0x40 ){
 			//互換動作: リスト指定の録画済み一覧取得コマンドを実装する
 			OutputDebugString(L"CMD2_EPG_SRV_GET_RECINFO_LIST2\r\n");
 			WORD ver;
@@ -2756,7 +2805,7 @@ bool CEpgTimerSrvMain::CtrlCmdProcessCompatible(CMD_STREAM& cmdParam, CMD_STREAM
 		}
 		break;
 	case CMD2_EPG_SRV_FILE_COPY2:
-		if( g_compatFlags & 0x80 ){
+		if( this->compatFlags & 0x80 ){
 			//互換動作: 指定ファイルをまとめて転送するコマンドを実装する
 			OutputDebugString(L"CMD2_EPG_SRV_FILE_COPY2\r\n");
 			WORD ver;
@@ -2832,7 +2881,7 @@ bool CEpgTimerSrvMain::CtrlCmdProcessCompatible(CMD_STREAM& cmdParam, CMD_STREAM
 		}
 		break;
 	case CMD2_EPG_SRV_GET_PG_INFO_LIST:
-		if( g_compatFlags & 0x100 ){
+		if( this->compatFlags & 0x100 ){
 			//互換動作: 番組情報取得(指定IDリスト)コマンドを実装する
 			OutputDebugString(L"CMD2_EPG_SRV_GET_PG_INFO_LIST\r\n");
 			if( this->epgDB.IsInitialLoadingDataDone() == false ){
@@ -2859,6 +2908,10 @@ bool CEpgTimerSrvMain::CtrlCmdProcessCompatible(CMD_STREAM& cmdParam, CMD_STREAM
 	}
 	return false;
 }
+
+#ifndef LUA_BUILD_AS_DLL
+extern "C" int luaopen_zlib(lua_State*);
+#endif
 
 void CEpgTimerSrvMain::InitLuaCallback(lua_State* L)
 {
@@ -2981,6 +3034,11 @@ void CEpgTimerSrvMain::InitLuaCallback(lua_State* L)
 		" end end"
 		" return r;"
 		"end");
+
+#ifndef LUA_BUILD_AS_DLL
+	//組み込みのzlibをロード済みにする
+	luaL_requiref(L, "zlib", luaopen_zlib, 0);
+#endif
 }
 
 #if 1
@@ -3342,8 +3400,7 @@ int CEpgTimerSrvMain::LuaSearchEpg(lua_State* L)
 			return 1;
 		}
 	}else if( lua_gettop(L) == 1 && lua_istable(L, -1) ){
-		vector<EPGDB_SEARCH_KEY_INFO> keyList(1);
-		EPGDB_SEARCH_KEY_INFO& key = keyList.back();
+		EPGDB_SEARCH_KEY_INFO key;
 		FetchEpgSearchKeyInfo(ws, key);
 		//対象ネットワーク
 		vector<EPGDB_SERVICE_INFO> list;
@@ -3363,7 +3420,7 @@ int CEpgTimerSrvMain::LuaSearchEpg(lua_State* L)
 				}
 			}
 		}
-		bool ret = ws.sys->epgDB.SearchEpg(&keyList, [&ws](vector<CEpgDBManager::SEARCH_RESULT_EVENT>& val) {
+		ws.sys->epgDB.SearchEpg(&key, 1, [&ws](vector<CEpgDBManager::SEARCH_RESULT_EVENT>& val) {
 			SYSTEMTIME now;
 			ConvertSystemTime(GetNowI64Time(), &now);
 			now.wHour = 0;
@@ -3392,9 +3449,7 @@ int CEpgTimerSrvMain::LuaSearchEpg(lua_State* L)
 				}
 			}
 		});
-		if( ret ){
-			return 1;
-		}
+		return 1;
 	}
 	lua_pushnil(L);
 	return 1;
@@ -3851,87 +3906,87 @@ void CEpgTimerSrvMain::PushEpgEventInfo(CLuaWorkspace& ws, const EPGDB_EVENT_INF
 		LuaHelp::reg_int(L, "durationSecond", (int)e.durationSec);
 	}
 	LuaHelp::reg_boolean(L, "freeCAFlag", e.freeCAFlag != 0);
-	if( e.shortInfo ){
+	if( e.hasShortInfo ){
 		lua_pushstring(L, "shortInfo");
 		lua_createtable(L, 0, 2);
-		LuaHelp::reg_string(L, "event_name", ws.WtoUTF8(e.shortInfo->event_name));
-		LuaHelp::reg_string(L, "text_char", ws.WtoUTF8(e.shortInfo->text_char));
+		LuaHelp::reg_string(L, "event_name", ws.WtoUTF8(e.shortInfo.event_name));
+		LuaHelp::reg_string(L, "text_char", ws.WtoUTF8(e.shortInfo.text_char));
 		lua_rawset(L, -3);
 	}
-	if( e.extInfo ){
+	if( e.hasExtInfo ){
 		lua_pushstring(L, "extInfo");
 		lua_createtable(L, 0, 1);
-		LuaHelp::reg_string(L, "text_char", ws.WtoUTF8(e.extInfo->text_char));
+		LuaHelp::reg_string(L, "text_char", ws.WtoUTF8(e.extInfo.text_char));
 		lua_rawset(L, -3);
 	}
-	if( e.contentInfo ){
+	if( e.hasContentInfo ){
 		lua_pushstring(L, "contentInfoList");
 		lua_newtable(L);
-		for( size_t i = 0; i < e.contentInfo->nibbleList.size(); i++ ){
+		for( size_t i = 0; i < e.contentInfo.nibbleList.size(); i++ ){
 			lua_createtable(L, 0, 2);
-			LuaHelp::reg_int(L, "content_nibble", e.contentInfo->nibbleList[i].content_nibble_level_1 << 8 | e.contentInfo->nibbleList[i].content_nibble_level_2);
-			LuaHelp::reg_int(L, "user_nibble", e.contentInfo->nibbleList[i].user_nibble_1 << 8 | e.contentInfo->nibbleList[i].user_nibble_2);
+			LuaHelp::reg_int(L, "content_nibble", e.contentInfo.nibbleList[i].content_nibble_level_1 << 8 | e.contentInfo.nibbleList[i].content_nibble_level_2);
+			LuaHelp::reg_int(L, "user_nibble", e.contentInfo.nibbleList[i].user_nibble_1 << 8 | e.contentInfo.nibbleList[i].user_nibble_2);
 			lua_rawseti(L, -2, (int)i + 1);
 		}
 		lua_rawset(L, -3);
 	}
-	if( e.componentInfo ){
+	if( e.hasComponentInfo ){
 		lua_pushstring(L, "componentInfo");
 		lua_createtable(L, 0, 4);
-		LuaHelp::reg_int(L, "stream_content", e.componentInfo->stream_content);
-		LuaHelp::reg_int(L, "component_type", e.componentInfo->component_type);
-		LuaHelp::reg_int(L, "component_tag", e.componentInfo->component_tag);
-		LuaHelp::reg_string(L, "text_char", ws.WtoUTF8(e.componentInfo->text_char));
+		LuaHelp::reg_int(L, "stream_content", e.componentInfo.stream_content);
+		LuaHelp::reg_int(L, "component_type", e.componentInfo.component_type);
+		LuaHelp::reg_int(L, "component_tag", e.componentInfo.component_tag);
+		LuaHelp::reg_string(L, "text_char", ws.WtoUTF8(e.componentInfo.text_char));
 		lua_rawset(L, -3);
 	}
-	if( e.audioInfo ){
+	if( e.hasAudioInfo ){
 		lua_pushstring(L, "audioInfoList");
 		lua_newtable(L);
-		for( size_t i = 0; i < e.audioInfo->componentList.size(); i++ ){
+		for( size_t i = 0; i < e.audioInfo.componentList.size(); i++ ){
 			lua_createtable(L, 0, 10);
-			LuaHelp::reg_int(L, "stream_content", e.audioInfo->componentList[i].stream_content);
-			LuaHelp::reg_int(L, "component_type", e.audioInfo->componentList[i].component_type);
-			LuaHelp::reg_int(L, "component_tag", e.audioInfo->componentList[i].component_tag);
-			LuaHelp::reg_int(L, "stream_type", e.audioInfo->componentList[i].stream_type);
-			LuaHelp::reg_int(L, "simulcast_group_tag", e.audioInfo->componentList[i].simulcast_group_tag);
-			LuaHelp::reg_boolean(L, "ES_multi_lingual_flag", e.audioInfo->componentList[i].ES_multi_lingual_flag != 0);
-			LuaHelp::reg_boolean(L, "main_component_flag", e.audioInfo->componentList[i].main_component_flag != 0);
-			LuaHelp::reg_int(L, "quality_indicator", e.audioInfo->componentList[i].quality_indicator);
-			LuaHelp::reg_int(L, "sampling_rate", e.audioInfo->componentList[i].sampling_rate);
-			LuaHelp::reg_string(L, "text_char", ws.WtoUTF8(e.audioInfo->componentList[i].text_char));
+			LuaHelp::reg_int(L, "stream_content", e.audioInfo.componentList[i].stream_content);
+			LuaHelp::reg_int(L, "component_type", e.audioInfo.componentList[i].component_type);
+			LuaHelp::reg_int(L, "component_tag", e.audioInfo.componentList[i].component_tag);
+			LuaHelp::reg_int(L, "stream_type", e.audioInfo.componentList[i].stream_type);
+			LuaHelp::reg_int(L, "simulcast_group_tag", e.audioInfo.componentList[i].simulcast_group_tag);
+			LuaHelp::reg_boolean(L, "ES_multi_lingual_flag", e.audioInfo.componentList[i].ES_multi_lingual_flag != 0);
+			LuaHelp::reg_boolean(L, "main_component_flag", e.audioInfo.componentList[i].main_component_flag != 0);
+			LuaHelp::reg_int(L, "quality_indicator", e.audioInfo.componentList[i].quality_indicator);
+			LuaHelp::reg_int(L, "sampling_rate", e.audioInfo.componentList[i].sampling_rate);
+			LuaHelp::reg_string(L, "text_char", ws.WtoUTF8(e.audioInfo.componentList[i].text_char));
 			lua_rawseti(L, -2, (int)i + 1);
 		}
 		lua_rawset(L, -3);
 	}
-	if( e.eventGroupInfo ){
+	if( e.eventGroupInfoGroupType ){
 		lua_pushstring(L, "eventGroupInfo");
 		lua_createtable(L, 0, 2);
-		LuaHelp::reg_int(L, "group_type", e.eventGroupInfo->group_type);
+		LuaHelp::reg_int(L, "group_type", e.eventGroupInfoGroupType);
 		lua_pushstring(L, "eventDataList");
 		lua_newtable(L);
-		for( size_t i = 0; i < e.eventGroupInfo->eventDataList.size(); i++ ){
+		for( size_t i = 0; i < e.eventGroupInfo.eventDataList.size(); i++ ){
 			lua_createtable(L, 0, 4);
-			LuaHelp::reg_int(L, "onid", e.eventGroupInfo->eventDataList[i].original_network_id);
-			LuaHelp::reg_int(L, "tsid", e.eventGroupInfo->eventDataList[i].transport_stream_id);
-			LuaHelp::reg_int(L, "sid", e.eventGroupInfo->eventDataList[i].service_id);
-			LuaHelp::reg_int(L, "eid", e.eventGroupInfo->eventDataList[i].event_id);
+			LuaHelp::reg_int(L, "onid", e.eventGroupInfo.eventDataList[i].original_network_id);
+			LuaHelp::reg_int(L, "tsid", e.eventGroupInfo.eventDataList[i].transport_stream_id);
+			LuaHelp::reg_int(L, "sid", e.eventGroupInfo.eventDataList[i].service_id);
+			LuaHelp::reg_int(L, "eid", e.eventGroupInfo.eventDataList[i].event_id);
 			lua_rawseti(L, -2, (int)i + 1);
 		}
 		lua_rawset(L, -3);
 		lua_rawset(L, -3);
 	}
-	if( e.eventRelayInfo ){
+	if( e.eventRelayInfoGroupType ){
 		lua_pushstring(L, "eventRelayInfo");
 		lua_createtable(L, 0, 2);
-		LuaHelp::reg_int(L, "group_type", e.eventRelayInfo->group_type);
+		LuaHelp::reg_int(L, "group_type", e.eventRelayInfoGroupType);
 		lua_pushstring(L, "eventDataList");
 		lua_newtable(L);
-		for( size_t i = 0; i < e.eventRelayInfo->eventDataList.size(); i++ ){
+		for( size_t i = 0; i < e.eventRelayInfo.eventDataList.size(); i++ ){
 			lua_createtable(L, 0, 4);
-			LuaHelp::reg_int(L, "onid", e.eventRelayInfo->eventDataList[i].original_network_id);
-			LuaHelp::reg_int(L, "tsid", e.eventRelayInfo->eventDataList[i].transport_stream_id);
-			LuaHelp::reg_int(L, "sid", e.eventRelayInfo->eventDataList[i].service_id);
-			LuaHelp::reg_int(L, "eid", e.eventRelayInfo->eventDataList[i].event_id);
+			LuaHelp::reg_int(L, "onid", e.eventRelayInfo.eventDataList[i].original_network_id);
+			LuaHelp::reg_int(L, "tsid", e.eventRelayInfo.eventDataList[i].transport_stream_id);
+			LuaHelp::reg_int(L, "sid", e.eventRelayInfo.eventDataList[i].service_id);
+			LuaHelp::reg_int(L, "eid", e.eventRelayInfo.eventDataList[i].event_id);
 			lua_rawseti(L, -2, (int)i + 1);
 		}
 		lua_rawset(L, -3);
